@@ -10,7 +10,7 @@ import time
 
 print("STEP 1: Program started")
 NEWS_API_KEY = "f046c6f6fd4449aab320b83d4bf61096"
-COMPANY = "Airtel"
+COMPANY = Input("Enter Company: ")
 
 print("STEP 2: Company entered:", COMPANY)
 url = "https://newsapi.org/v2/everything"
