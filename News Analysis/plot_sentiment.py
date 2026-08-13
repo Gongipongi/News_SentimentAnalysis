@@ -1,18 +1,16 @@
 import sqlite3
 from pathlib import Path
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import matplotlib.dates as mdates
 try:
-    import plotly.express as px
-except Exception:
-    px = None
-try:
     import yfinance as yf
 except Exception:
     yf = None
-from datetime import datetime, timedelta
+from datetime import datetime
 
 DB_PATH = Path(__file__).parent / "news_database.db"
 
@@ -66,33 +64,45 @@ def get_earliest_news_date(company, db_path=DB_PATH):
     return pd.to_datetime(df['min_date'].iloc[0])
 
 
-def get_stock_ticker(company):
-    """Map company name to stock ticker symbol.
-    This is a simple mapping - extend as needed."""
+def get_stock_ticker(company, ticker=None):
+    """Resolve a stock ticker for the company.
+    Prefer an explicit ticker passed by the user; otherwise fall back to a mapping.
+    """
+    if ticker:
+        return ticker.strip()
+
     ticker_map = {
-        'Airtel': 'BHARTIARTL.NS',  # Bharti Airtel Limited
-        'Tesla': 'TSLA',
-        'Apple': 'AAPL',
-        'Microsoft': 'MSFT',
-        'Google': 'GOOGL',
-        'Amazon': 'AMZN',
-        'Facebook': 'META',
-        'Meta': 'META',
-        'NVIDIA': 'NVDA',
-        'Intel': 'INTC',
-        'AMD': 'AMD',
-        'IBM': 'IBM',
+        'airtel': 'BHARTIARTL.NS',
+        'bharti airtel': 'BHARTIARTL.NS',
+        'tesla': 'TSLA',
+        'apple': 'AAPL',
+        'microsoft': 'MSFT',
+        'google': 'GOOGL',
+        'amazon': 'AMZN',
+        'facebook': 'META',
+        'meta': 'META',
+        'nvidia': 'NVDA',
+        'intel': 'INTC',
+        'amd': 'AMD',
+        'ibm': 'IBM',
+        'vodafone idea': 'IDEA.NS',
+        'vodafoneidea': 'IDEA.NS',
+        'vi': 'IDEA.NS',
+        'idea': 'IDEA.NS',
     }
-    return ticker_map.get(company.strip(), f"{company}.NS")  # Default to Indian NSE ticker
+    lookup = company.strip().lower().replace('-', ' ')
+    if lookup in ticker_map:
+        return ticker_map[lookup]
+    return f"{company.strip()}.NS"
 
 
-def fetch_stock_data(company, start_date=None, end_date=None):
-    """Fetch stock data using yfinance for the given company."""
+def fetch_stock_data(company, start_date=None, end_date=None, ticker=None):
+    """Fetch stock data using yfinance for the given company and ticker."""
     if yf is None:
         print("yfinance is not installed. Install it with: pip install yfinance")
         return None
     
-    ticker = get_stock_ticker(company)
+    ticker = get_stock_ticker(company, ticker)
     
     if start_date is None:
         start_date = get_earliest_news_date(company)
@@ -160,7 +170,7 @@ def plot_time_series(company, resample='D', save_path=None, show=True, dpi=200):
     return ts
 
 
-def plot_sentiment_and_stock(company, resample='D', save_sentiment=None, save_stock=None, show=True, dpi=200):
+def plot_sentiment_and_stock(company, resample='D', save_sentiment=None, save_stock=None, show=True, dpi=200, ticker=None):
     """Plot sentiment and stock price on separate graphs for the given company.
     
     The time range is from the earliest published date to the latest stock data available.
@@ -175,9 +185,9 @@ def plot_sentiment_and_stock(company, resample='D', save_sentiment=None, save_st
     earliest_date = df_sentiment.index.min()
     
     # Load stock data
-    stock_data = fetch_stock_data(company, start_date=earliest_date)
+    stock_data = fetch_stock_data(company, start_date=earliest_date, ticker=ticker)
     if stock_data is None or stock_data.empty:
-        print(f"No stock data found for {company}")
+        print(f"No stock data found for {company}. The sentiment graph will still be saved if requested.")
         return None, None
     
     # Convert Date column to datetime and set as index
@@ -249,68 +259,23 @@ def plot_sentiment_and_stock(company, resample='D', save_sentiment=None, save_st
     return ts_sentiment, stock_data
 
 
-
-    if px is None:
-        print("Plotly is not installed. Install it with: pip install plotly")
-        return None
-
-    df = load_company_df(company)
-    if df.empty:
-        print(f"No data found for {company}")
-        return None
-
-    end = pd.Timestamp.now()
-    start = end - pd.Timedelta(days=days)
-
-    df_period = df.loc[(df.index >= start) & (df.index <= end)]
-    if df_period.empty:
-        print(f"No articles for {company} in the last {days} days")
-        return None
-
-    # compute daily mean and counts, then keep only days with at least one article
-    daily_mean = df_period['score'].resample('D').mean()
-    daily_count = df_period['score'].resample('D').count()
-    daily = pd.DataFrame({'score': daily_mean, 'count': daily_count})
-    daily = daily[daily['count'] > 0]
-    if daily.empty:
-        print(f"No daily aggregates available for {company} in the last {days} days")
-        return None
-
-    daily = daily.reset_index()
-
-    fig = px.line(daily, x='published_date', y='score', markers=True,
-                  title=f"Daily averaged compound sentiment for {company} (last {days} days)",
-                  labels={'published_date': 'Date', 'score': 'Compound score'},
-                  hover_data={'score': ':.4f', 'count': True})
-    fig.update_traces(mode='lines+markers')
-    fig.update_layout(hovermode='x unified')
-
-    if save_html:
-        fig.write_html(save_html, include_plotlyjs='cdn')
-        print(f"Saved interactive HTML to {save_html}")
-    else:
-        fig.show()
-
-    return daily
-
-
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Plot company sentiment over time')
-    parser.add_argument('--company', '-c', required=False, help='Company name to filter (case-insensitive). If omitted, you will be prompted.')
+    parser = argparse.ArgumentParser(description='Plot sentiment and stock charts for a company.')
+    parser.add_argument('--company', '-c', help='Company name to filter (case-insensitive).')
+    parser.add_argument('--ticker', '-t', help='Stock ticker symbol for accurate price data (e.g. BHARTIARTL.NS).')
     parser.add_argument('--resample', '-r', default='D', help='Resample frequency, e.g. D, W, M. Use empty string for raw per-article times.')
     parser.add_argument('--out', '-o', help='Output PNG path for sentiment plot')
     parser.add_argument('--dpi', type=int, default=200, help='DPI for saved PNG')
-    parser.add_argument('--interactive', action='store_true', help='Produce interactive HTML output using Plotly')
-    parser.add_argument('--days', type=int, default=30, help='Number of past days to include for interactive plot')
-    parser.add_argument('--html', help='Output HTML path for interactive plot')
-    parser.add_argument('--stock', action='store_true', help='Generate separate sentiment and stock price plots')
+    parser.add_argument('--stock', action='store_true', help='Generate both sentiment and stock price plots (default behavior).')
     parser.add_argument('--stock-out', help='Output PNG path for stock price plot')
+    parser.add_argument('--sentiment-only', action='store_true', help='Generate only the sentiment chart.')
     args = parser.parse_args()
 
-    # Determine company (prompt if not supplied)
     company = args.company
+    ticker = args.ticker
+
     if not company:
         companies = list_companies()
         if not companies:
@@ -332,13 +297,27 @@ if __name__ == '__main__':
         else:
             company = sel
 
-    # Sentiment and Stock mode
-    if getattr(args, 'stock', False):
+    if not ticker:
+        ticker = input(f"Enter stock ticker for {company} (for example BHARTIARTL.NS or IDEA.NS): ").strip()
+
+    if not ticker:
+        print("No ticker was entered. The script will still create the sentiment chart, but stock data cannot be fetched without a valid ticker symbol.")
+        ticker = None
+
+    if getattr(args, 'sentiment_only', False):
+        default_out = f"{company}_sentiment.png"
         resample_arg = args.resample if args.resample != '' else None
-        plot_sentiment_and_stock(company, resample=resample_arg, save_sentiment=args.out, save_stock=args.stock_out, show=True, dpi=args.dpi)
-    # Interactive mode
-    elif getattr(args, 'interactive', False):
-        plot_interactive(company, days=args.days, save_html=args.html)
+        plot_time_series(company, resample=resample_arg, save_path=args.out or default_out, show=False, dpi=args.dpi)
     else:
+        default_sentiment = f"{company}_sentiment.png"
+        default_stock = f"{company}_stock.png"
         resample_arg = args.resample if args.resample != '' else None
-        plot_time_series(company, resample=resample_arg, save_path=args.out, show=True, dpi=args.dpi)
+        plot_sentiment_and_stock(
+            company,
+            resample=resample_arg,
+            save_sentiment=args.out or default_sentiment,
+            save_stock=args.stock_out or default_stock,
+            show=False,
+            dpi=args.dpi,
+            ticker=ticker,
+        )
