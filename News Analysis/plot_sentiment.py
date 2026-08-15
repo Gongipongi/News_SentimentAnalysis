@@ -1,4 +1,5 @@
 import sqlite3
+import re
 from pathlib import Path
 import pandas as pd
 import matplotlib
@@ -46,6 +47,155 @@ def list_companies(db_path=DB_PATH):
     return df['company'].dropna().tolist()
 
 
+def create_daily_sentiment_stock_table(db_path=DB_PATH):
+    """Create the aggregate table storing daily average sentiment and daily close prices."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_sentiment_stock (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company TEXT NOT NULL,
+                date TEXT NOT NULL,
+                avg_sentiment REAL NOT NULL,
+                close_price REAL,
+                article_count INTEGER DEFAULT 0,
+                UNIQUE(company, date)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_daily_sentiment_stock_company_date ON daily_sentiment_stock(company, date)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def build_daily_sentiment_stock_table(db_path=DB_PATH, company=None):
+    """Populate daily_sentiment_stock with one row per company-day.
+
+    Each row stores the mean sentiment score across all articles for that company on that day,
+    along with the corresponding daily closing stock price from yfinance.
+    """
+    create_daily_sentiment_stock_table(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        if company is None:
+            companies = list_companies(db_path)
+        else:
+            companies = [company]
+
+        for current_company in companies:
+            sentiment_df = pd.read_sql_query(
+                """
+                SELECT date(published_date) AS date, AVG(score) AS avg_sentiment, COUNT(*) AS article_count
+                FROM articles
+                WHERE lower(company) = lower(?)
+                GROUP BY date(published_date)
+                ORDER BY date
+                """,
+                conn,
+                params=(current_company,),
+            )
+
+            if sentiment_df.empty:
+                continue
+
+            sentiment_df['date'] = pd.to_datetime(sentiment_df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+            sentiment_df = sentiment_df.dropna(subset=['date'])
+            if sentiment_df.empty:
+                continue
+
+            stock_data = fetch_stock_data(
+                current_company,
+                start_date=sentiment_df['date'].min(),
+                end_date=sentiment_df['date'].max(),
+                ticker=None,
+            )
+
+            if stock_data is not None and not stock_data.empty:
+                stock_data = stock_data.copy()
+                stock_data['Date'] = pd.to_datetime(stock_data['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                if 'Close' in stock_data.columns:
+                    stock_series = stock_data[['Date', 'Close']].rename(columns={'Close': 'close_price'})
+                elif 'Adj Close' in stock_data.columns:
+                    stock_series = stock_data[['Date', 'Adj Close']].rename(columns={'Adj Close': 'close_price'})
+                else:
+                    stock_series = stock_data[['Date', stock_data.columns[-1]]].rename(columns={stock_data.columns[-1]: 'close_price'})
+                stock_series = stock_series.dropna(subset=['Date'])
+            else:
+                stock_series = pd.DataFrame(columns=['Date', 'close_price'])
+
+            merged = sentiment_df.merge(stock_series, left_on='date', right_on='Date', how='left')
+            merged = merged[['date', 'avg_sentiment', 'article_count', 'close_price']].copy()
+            merged['company'] = current_company
+            merged = merged[['company', 'date', 'avg_sentiment', 'close_price', 'article_count']]
+
+            if merged.empty:
+                continue
+
+            conn.execute(
+                "DELETE FROM daily_sentiment_stock WHERE lower(company) = lower(?)",
+                (current_company,),
+            )
+
+            for record in merged.to_dict(orient='records'):
+                close_price = record.get('close_price')
+                if pd.isna(close_price):
+                    close_price = None
+                else:
+                    close_price = float(close_price)
+
+                conn.execute(
+                    """
+                    INSERT INTO daily_sentiment_stock (company, date, avg_sentiment, close_price, article_count)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(company, date) DO UPDATE SET
+                        avg_sentiment = excluded.avg_sentiment,
+                        close_price = excluded.close_price,
+                        article_count = excluded.article_count
+                    """,
+                    (
+                        record['company'],
+                        record['date'],
+                        float(record['avg_sentiment']),
+                        close_price,
+                        int(record['article_count']),
+                    ),
+                )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_daily_sentiment_stock(company=None, db_path=DB_PATH):
+    """Return the daily aggregate table for one company or the full table."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        if company:
+            df = pd.read_sql_query(
+                "SELECT company, date, avg_sentiment, close_price, article_count FROM daily_sentiment_stock WHERE lower(company) = lower(?) ORDER BY date",
+                conn,
+                params=(company,),
+            )
+        else:
+            df = pd.read_sql_query(
+                "SELECT company, date, avg_sentiment, close_price, article_count FROM daily_sentiment_stock ORDER BY company, date",
+                conn,
+            )
+    finally:
+        conn.close()
+
+    if df.empty:
+        return df
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    return df
+
+
 def get_earliest_news_date(company, db_path=DB_PATH):
     """Get the earliest published date for a company's news articles."""
     conn = sqlite3.connect(str(db_path))
@@ -74,6 +224,8 @@ def get_stock_ticker(company, ticker=None):
     ticker_map = {
         'airtel': 'BHARTIARTL.NS',
         'bharti airtel': 'BHARTIARTL.NS',
+        'coal india': 'COALINDIA.NS',
+        'coalindia': 'COALINDIA.NS',
         'tesla': 'TSLA',
         'apple': 'AAPL',
         'microsoft': 'MSFT',
@@ -89,11 +241,17 @@ def get_stock_ticker(company, ticker=None):
         'vodafoneidea': 'IDEA.NS',
         'vi': 'IDEA.NS',
         'idea': 'IDEA.NS',
+        'hpcl': 'HINDPETRO.NS',
+        'hindustan petroleum': 'HINDPETRO.NS',
+        'hindustan petroleum corporation': 'HINDPETRO.NS',
+        'hindpetro': 'HINDPETRO.NS',
     }
     lookup = company.strip().lower().replace('-', ' ')
     if lookup in ticker_map:
         return ticker_map[lookup]
-    return f"{company.strip()}.NS"
+
+    sanitized = re.sub(r'[^A-Za-z0-9]+', '', company.strip()).upper()
+    return f"{sanitized}.NS"
 
 
 def fetch_stock_data(company, start_date=None, end_date=None, ticker=None):
@@ -101,29 +259,36 @@ def fetch_stock_data(company, start_date=None, end_date=None, ticker=None):
     if yf is None:
         print("yfinance is not installed. Install it with: pip install yfinance")
         return None
-    
-    ticker = get_stock_ticker(company, ticker)
-    
+
+    ticker = get_stock_ticker(company, ticker).strip()
+    if " " in ticker and ticker.lower().endswith(('.ns', '.bo', '.nse', '.bom')):
+        ticker = ticker.replace(' ', '')
+
     if start_date is None:
         start_date = get_earliest_news_date(company)
-    
+
     if start_date is None:
         print(f"No news data found for {company}")
         return None
-    
+
     if end_date is None:
         end_date = datetime.now()
-    
+
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+
     try:
-        print(f"Fetching stock data for {ticker} from {start_date.date()} to {end_date.date()}")
-        stock_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-        
+        print(f"Fetching stock data for {ticker} from {start_ts.date()} to {end_ts.date()}")
+        stock_data = yf.download(ticker, start=start_ts, end=end_ts, progress=False)
+
         if stock_data.empty:
             print(f"No stock data found for ticker {ticker}")
             return None
-        
+
         # Reset index to make date a column
         stock_data = stock_data.reset_index()
+        if isinstance(stock_data.columns, pd.MultiIndex):
+            stock_data.columns = [col[0] if isinstance(col, tuple) else col for col in stock_data.columns]
         return stock_data
     except Exception as e:
         print(f"Error fetching stock data for {ticker}: {e}")
@@ -171,8 +336,8 @@ def plot_time_series(company, resample='D', save_path=None, show=True, dpi=200):
 
 
 def plot_sentiment_and_stock(company, resample='D', save_sentiment=None, save_stock=None, show=True, dpi=200, ticker=None):
-    """Plot sentiment and stock price on separate graphs for the given company.
-    
+    """Plot sentiment and stock price in a single combined figure for the given company.
+
     The time range is from the earliest published date to the latest stock data available.
     """
     # Load sentiment data
@@ -180,20 +345,20 @@ def plot_sentiment_and_stock(company, resample='D', save_sentiment=None, save_st
     if df_sentiment.empty:
         print(f"No sentiment data found for {company}")
         return None, None
-    
+
     # Get earliest date from news
     earliest_date = df_sentiment.index.min()
-    
+
     # Load stock data
     stock_data = fetch_stock_data(company, start_date=earliest_date, ticker=ticker)
     if stock_data is None or stock_data.empty:
         print(f"No stock data found for {company}. The sentiment graph will still be saved if requested.")
         return None, None
-    
+
     # Convert Date column to datetime and set as index
     stock_data['Date'] = pd.to_datetime(stock_data['Date'])
     stock_data.set_index('Date', inplace=True)
-    
+
     # Resample sentiment data if requested
     if resample:
         ts_sentiment = df_sentiment.resample(resample).mean()
@@ -201,61 +366,54 @@ def plot_sentiment_and_stock(company, resample='D', save_sentiment=None, save_st
     else:
         ts_sentiment = df_sentiment
         plot_sentiment_series = df_sentiment['score']
-    
-    # Create figure 1: Sentiment
-    fig1 = plt.figure(figsize=(14, 6), dpi=dpi)
-    sns.lineplot(data=plot_sentiment_series, label='Compound score', linewidth=2.2, color='steelblue')
-    
-    ax = plt.gca()
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+
+    plot_sentiment_series = plot_sentiment_series.copy()
+    plot_sentiment_series.name = 'sentiment'
+
+    if 'Close' in stock_data.columns:
+        stock_series = stock_data['Close'].copy()
+    elif 'Adj Close' in stock_data.columns:
+        stock_series = stock_data['Adj Close'].copy()
+    else:
+        stock_series = stock_data.iloc[:, -1].copy()
+    stock_series.name = 'close_price'
+
+    combined = pd.concat([plot_sentiment_series, stock_series], axis=1, join='inner')
+    if combined.empty:
+        print(f"No overlapping sentiment and stock data found for {company}.")
+        return ts_sentiment, stock_data
+
+    fig, ax1 = plt.subplots(figsize=(14, 6), dpi=dpi)
+    sns.lineplot(data=combined['sentiment'], ax=ax1, label='Compound score', linewidth=2.2, color='steelblue')
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel('Sentiment Score', color='steelblue')
+    ax1.tick_params(axis='y', labelcolor='steelblue')
+    ax1.grid(True, alpha=0.3)
+    ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax1.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
     plt.xticks(rotation=45)
-    
-    plt.title(f"Sentiment Analysis for {company}")
-    plt.xlabel("Date")
-    plt.ylabel("Sentiment Score")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.plot(combined.index, combined['close_price'], label='Stock Close Price', linewidth=2.2, color='darkgreen')
+    ax2.set_ylabel('Price', color='darkgreen')
+    ax2.tick_params(axis='y', labelcolor='darkgreen')
+
+    handles1, labels1 = ax1.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(handles1 + handles2, labels1 + labels2, loc='upper left')
+
+    plt.title(f"{company} sentiment vs stock price")
     plt.tight_layout()
-    
-    if save_sentiment:
-        plt.savefig(save_sentiment, bbox_inches='tight', dpi=dpi)
-        print(f"Saved sentiment plot to {save_sentiment}")
-    
-    # Only show if not saving files
-    if show and not save_sentiment:
+
+    output_path = save_sentiment or save_stock
+    if output_path:
+        plt.savefig(output_path, bbox_inches='tight', dpi=dpi)
+        print(f"Saved combined sentiment/stock plot to {output_path}")
+
+    if show and not output_path:
         plt.show()
-    
-    plt.close()
-    
-    # Create figure 2: Stock Price
-    fig2 = plt.figure(figsize=(14, 6), dpi=dpi)
-    
-    # Plot closing price using matplotlib instead of seaborn to avoid multi-index issues
-    plt.plot(stock_data.index, stock_data['Close'].values, label='Stock Close Price', linewidth=2.2, color='darkgreen')
-    
-    ax = plt.gca()
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
-    plt.xticks(rotation=45)
-    
-    plt.title(f"Stock Price for {company}")
-    plt.xlabel("Date")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    if save_stock:
-        plt.savefig(save_stock, bbox_inches='tight', dpi=dpi)
-        print(f"Saved stock plot to {save_stock}")
-    
-    # Only show if not saving files
-    if show and not save_stock:
-        plt.show()
-    
-    plt.close()
-    
+
+    plt.close(fig)
     return ts_sentiment, stock_data
 
 
@@ -309,14 +467,14 @@ if __name__ == '__main__':
         resample_arg = args.resample if args.resample != '' else None
         plot_time_series(company, resample=resample_arg, save_path=args.out or default_out, show=False, dpi=args.dpi)
     else:
-        default_sentiment = f"{company}_sentiment.png"
-        default_stock = f"{company}_stock.png"
+        default_combined = f"{company}_sentiment_stock.png"
         resample_arg = args.resample if args.resample != '' else None
+        output_path = args.out or args.stock_out or default_combined
         plot_sentiment_and_stock(
             company,
             resample=resample_arg,
-            save_sentiment=args.out or default_sentiment,
-            save_stock=args.stock_out or default_stock,
+            save_sentiment=output_path,
+            save_stock=None,
             show=False,
             dpi=args.dpi,
             ticker=ticker,

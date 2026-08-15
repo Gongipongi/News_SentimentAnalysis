@@ -31,6 +31,14 @@ print("\nAvailable companies:")
 for company in companies:
     print(f"  - {company}")
 
+# Daily aggregate table regression check
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_sentiment_stock'")
+aggregate_table = cursor.fetchone()
+if aggregate_table is None:
+    print("\n✗ Missing daily sentiment/stock aggregate table: daily_sentiment_stock")
+else:
+    print("\n✓ Daily aggregate table exists: daily_sentiment_stock")
+
 # Test with first company
 if companies:
     test_company = companies[0]
@@ -45,6 +53,22 @@ if companies:
     # Get ticker
     ticker = get_stock_ticker(test_company)
     print(f"✓ Stock ticker: {ticker}")
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM daily_sentiment_stock WHERE company = ?",
+        (test_company,)
+    )
+    daily_count = cursor.fetchone()[0]
+    if daily_count:
+        print(f"✓ Daily aggregate rows for {test_company}: {daily_count}")
+        print("  Sample rows:")
+        for row in cursor.execute(
+            "SELECT company, date, avg_sentiment, close_price FROM daily_sentiment_stock WHERE company = ? ORDER BY date DESC LIMIT 3",
+            (test_company,)
+        ).fetchall():
+            print(f"    {row}")
+    else:
+        print(f"✗ No daily aggregate rows for {test_company}")
     
     # Fetch stock data
     print("\nFetching stock data...")

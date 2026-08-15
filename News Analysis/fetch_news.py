@@ -4,7 +4,7 @@ import json
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import sqlite3
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from SentimentAnalysis import polarity_scores_roberta
 import time
 
@@ -15,11 +15,17 @@ COMPANY = input("Enter Company: ")
 print("STEP 2: Company entered:", COMPANY)
 url = "https://newsapi.org/v2/everything"
 
+end_date = datetime(2026, 8, 3, tzinfo=timezone.utc)
+start_date = end_date - timedelta(days=45)
+
 params = {
-    "q": COMPANY,
+    "q": f"{COMPANY} AND (finance OR financial OR stock OR market OR earnings OR investment)",
     "language": "en",
+    "from": start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "to": end_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
     "sortBy": "publishedAt",
-    "pageSize": 50,
+    "pageSize": 100,
+    "page": 1,
     "apiKey": NEWS_API_KEY,
 }
 
@@ -27,19 +33,49 @@ params = {
 #       REQUESTING DATA THROUGH API
 #----------------------------------------------
 
-print(f"STEP 3: Sending API request...")
-response = requests.get(url, params=params, timeout=20)
-print("STEP 4: API status code:", response.status_code)
+all_articles = []
+max_pages = 10
+print(f"STEP 3: Fetching {COMPANY} articles from {params['from']} to {params['to']}...")
+print(f"STEP 3B: Will request pages 1 through {max_pages} sequentially")
 
-response.raise_for_status()
-data = response.json()
-print("STEP 5: API response received")
+for page in range(1, max_pages + 1):
+    params["page"] = page
+    print(f"STEP 4: Sending request for page {page}...")
+    response = requests.get(url, params=params, timeout=20)
+    print(f"STEP 4A: API status code on page {page}:", response.status_code)
+
+    if response.status_code == 426:
+        print("STEP 5: NewsAPI rejected additional pages for this plan. Continuing with the available 30-day results.")
+        break
+
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        print(f"STEP 5: API request failed: {exc}")
+        break
+
+    data = response.json()
+    articles = data.get("articles", [])
+    print(f"STEP 5: Page {page} returned {len(articles)} articles")
+
+    if not articles:
+        print(f"STEP 5A: No more articles returned on page {page}; stopping pagination.")
+        break
+
+    all_articles.extend(articles)
+
+    if len(articles) < params["pageSize"]:
+        print(f"STEP 5A: Fewer than {params['pageSize']} articles returned on page {page}; stopping pagination.")
+        break
+
+    # small pause between requests so the API doesn't block you
+    time.sleep(1)
+
+print(f"STEP 5B: Total articles collected for this 30-day window: {len(all_articles)}")
 
 # NewsAPI already filters by language, so no domain restriction is applied.
 # This fetches global English-language articles worldwide.
-print("STEP 5B: Using global English-language NewsAPI results")
-
-
+print("STEP 5C: Using global English-language NewsAPI results")
 
 # print(json.dumps(data, indent=2))
 
@@ -79,7 +115,7 @@ print("STEP 7: SQLite connected and table ensured")
 #----------------------------------------------
 #        INSERTING DATA INTO TABLES
 #----------------------------------------------
-articles = data.get("articles", [])
+articles = all_articles
 
 for d in articles:
     company = COMPANY
@@ -140,6 +176,14 @@ for d in articles:
 
 print("STEP 8: All articles processed, committing to DB")
 conn.commit()
+
+try:
+    from plot_sentiment import build_daily_sentiment_stock_table
+    build_daily_sentiment_stock_table(DB_PATH, company=COMPANY)
+    print(f"STEP 9: Daily sentiment and close-price aggregate refreshed for {COMPANY}")
+except Exception as exc:
+    print(f"STEP 9: Could not refresh daily aggregate table: {exc}")
+
 print("Articles stored successfully!")
 
 cursor.close()
